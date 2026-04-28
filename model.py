@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -66,11 +67,46 @@ class MultiHeadAttention(nn.Module):
 
         head_size = d_model // num_heads
         self.heads = nn.ModuleList([Head(d_model, head_size, max_seq_len) for _ in range(num_heads)])
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
     
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
 
         return out
+
+
+class FeedForward(nn.Module):
+    
+    def __init__(self, d_model):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(d_model, 4*d_model),
+            nn.ReLU(),
+            nn.Linear(4*d_model, d_model),
+        )
+    
+    def forward(self, x):
+        return self.model(x)
+
+
+class Block(nn.Module):
+
+    def __init__(self, d_model, chunk_size, num_heads):
+        super().__init__()
+
+        self.mha = MultiHeadAttention(d_model=d_model, num_heads=num_heads, max_seq_len=chunk_size)
+        self.ffwd = FeedForward(d_model=d_model)
+        self.ln1 = nn.LayerNorm(d_model)   # create once
+        self.ln2 = nn.LayerNorm(d_model)
+    
+    def forward(self, x):
+        x = x + self.mha(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+
+        return x
 
 
 class GPT(nn.Module):
@@ -80,21 +116,32 @@ class GPT(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)  # (B, T, C)
         self.pos_encoding = nn.Embedding(chunk_size, d_model)
-        self.mha = MultiHeadAttention(d_model=d_model, num_heads=num_heads, max_seq_len=chunk_size)
-        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.blocks = nn.Sequential(*[
+            Block(d_model, chunk_size, num_heads) for _ in range(6)
+        ])
+        self.ln_final = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         tok_emb = self.token_embedding(idx)
-        pos = torch.arange(idx.shape[1])
+        pos = torch.arange(idx.shape[1], device=idx.device)
         pos_emb = self.pos_encoding(pos)
+
         x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
 
-        out = self.mha(x)
-        out = self.proj(out)
+        B, T, V = logits.shape
 
-        return out
+        if targets == None:
+            loss = None
+        else:
+            loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
+
+        return logits, loss
     
-    
+
 model = GPT(vocab_size, d_model=64, chunk_size=chunk_size)
 xb, yb = get_batch(4, 8)
 out = model(xb, chunk_size)
