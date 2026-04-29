@@ -132,16 +132,19 @@ class GPT(nn.Module):
         return logits, loss, new_caches, weights
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, temperature=1.0):
         idx_cond = idx[:, -self.chunk_size:]
         logits, _, caches, _ = self(idx_cond, start_pos=0)
 
         # current absolute position of the next token to be generated
         cur_pos = idx_cond.shape[1]
 
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        if temperature == 0:
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        else:
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
         idx = torch.cat([idx, next_token], dim=1)
 
         for _ in range(max_new_tokens - 1):
@@ -154,9 +157,13 @@ class GPT(nn.Module):
                 logits, _, caches, _ = self(next_token, kv_caches=caches, start_pos=cur_pos)
                 cur_pos += 1
 
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            if temperature == 0:
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            else:
+                logits = logits[:, -1, :] / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
             idx = torch.cat([idx, next_token], dim=1)
 
         return idx
