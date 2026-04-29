@@ -14,16 +14,28 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(max_seq_len, max_seq_len)))
         self.head_size = head_size
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
         T = x.shape[1]
+
         q = self.query(x)
         k = self.key(x)
         v = self.value(x)
 
-        wei = q @ k.transpose(-2, -1)  # (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=1)  # (B, T_past + T_new, head_size)
+            v = torch.cat([past_v, v], dim=1)
+
+        new_cache = (k, v)
+
+        T_q = q.shape[1]
+        T_k = k.shape[1]
+
+        wei = q @ k.transpose(-2, -1)  # (B, T_q, T_k)
+        # rows correspond to positions [T_k - T_q, T_k); each row i can attend to keys [0, T_k - T_q + i]
+        wei = wei.masked_fill(self.tril[T_k - T_q:T_k, :T_k] == 0, float('-inf'))
         wei = torch.softmax(wei * self.head_size ** -0.5, dim=-1)
-        return wei @ v
+        return wei @ v, new_cache, wei
 
 
 class MultiHeadAttention(nn.Module):
@@ -35,9 +47,18 @@ class MultiHeadAttention(nn.Module):
         ])
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        return self.proj(out)
+    def forward(self, x, kv_cache=None):
+        if kv_cache is None:
+            kv_cache = [None] * len(self.heads)
+
+        outs, new_caches, weis = [], [], []
+        for h, c in zip(self.heads, kv_cache):
+            o, nc, w = h(x, c)
+            outs.append(o)
+            new_caches.append(nc)
+            weis.append(w)
+
+        return self.proj(torch.cat(outs, dim=-1)), new_caches, weis
 
 
 class FeedForward(nn.Module):
@@ -61,10 +82,12 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
 
-    def forward(self, x):
-        x = x + self.mha(self.ln1(x))
+    def forward(self, x, kv_cache=None):
+        attn_out, new_cache, weis = self.mha(self.ln1(x), kv_cache)
+        x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
-        return x
+
+        return x, new_cache, weis
 
 
 class GPT(nn.Module):
@@ -80,30 +103,69 @@ class GPT(nn.Module):
         self.ln_final = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_caches=None, start_pos=0):
+        T = idx.shape[1]
         tok_emb = self.token_embedding(idx)
-        pos = torch.arange(idx.shape[1], device=idx.device)
+        # absolute positions of the *new* tokens
+        pos = torch.arange(start_pos, start_pos + T, device=idx.device)
         pos_emb = self.pos_encoding(pos)
 
         x = tok_emb + pos_emb
-        x = self.blocks(x)
+
+        if kv_caches is None:
+            kv_caches = [None] * len(self.blocks)
+
+        new_caches, weights = [], []
+        for block, c in zip(self.blocks, kv_caches):
+            x, nc, weis = block(x, c)
+            new_caches.append(nc)
+            weights.append(weis)
+
         x = self.ln_final(x)
         logits = self.lm_head(x)
 
         if targets is None:
-            return logits, None
+            return logits, None, new_caches, weights
 
         B, T, V = logits.shape
         loss = F.cross_entropy(logits.view(B * T, V), targets.view(B * T))
-        return logits, loss
+        return logits, loss, new_caches, weights
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.chunk_size:]
-            logits, _ = self(idx_cond)
+        idx_cond = idx[:, -self.chunk_size:]
+        logits, _, caches, _ = self(idx_cond, start_pos=0)
+
+        # current absolute position of the next token to be generated
+        cur_pos = idx_cond.shape[1]
+
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_token], dim=1)
+
+        for _ in range(max_new_tokens - 1):
+            # if we'd exceed the context window, fall back to recomputing without cache
+            if cur_pos >= self.chunk_size:
+                idx_cond = idx[:, -self.chunk_size:]
+                logits, _, caches, _ = self(idx_cond, start_pos=0)
+                cur_pos = idx_cond.shape[1]
+            else:
+                logits, _, caches, _ = self(next_token, kv_caches=caches, start_pos=cur_pos)
+                cur_pos += 1
+
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_token], dim=1)
+
         return idx
+    
+    @torch.no_grad()
+    def visualize_attention(self, idx, max_new_tokens):
+        out = self.generate(idx, max_new_tokens)
+
+        out_cond = out[:, -self.chunk_size:]
+        _, _, _, weights = self(out_cond, start_pos=0)
+
+        return out, weights
